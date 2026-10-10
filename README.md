@@ -1,20 +1,27 @@
 # Viboscop
 
-Viboscop is a native Rust desktop app for playing WAV and FLAC files and visualizing their stereo audio as a live XY oscilloscope.
+Viboscop is a native Rust desktop app for visualizing stereo audio as a live XY oscilloscope.
 
-It loads a file, plays it through your system audio output, and draws the left/right channel pair in real time as a moving Lissajous trace.
+It supports:
+- audio file playback for WAV, FLAC, and MP3 files
+- live microphone input
+- real-time left/right channel XY plotting as a moving Lissajous trace
 
-This project was vibecoded because there was no practical, easy-to-use Linux tool for this kind of real-time stereo XY oscilloscope workflow.
+The app is designed for a quick, focused workflow: load a track or capture live mic input, then inspect the stereo relationship in real time.
 
 ## Features
 
-- Play WAV and FLAC files
+- Play WAV, FLAC, and MP3 files
+- Live microphone input capture
 - Real-time stereo XY oscilloscope view
+- Source switching between File and Microphone
 - Audio output with separate volume control
 - Add File dialog for loading tracks from the GUI
 - Theme switching
 - Fullscreen mode
 - Responsive desktop interface
+
+> Desktop audio capture is intentionally not included in the current version. The supported live input sources are file playback and microphone input only.
 
 ## Run
 
@@ -44,17 +51,20 @@ Add `~/.local/bin` to your `PATH` if needed.
 
 ## Controls
 
-- Add File: load a WAV or FLAC audio file
-- Play/Pause: start or stop playback
+- Add File: load a WAV, FLAC, or MP3 audio file
+- Input Source: switch between File and Microphone
+- Play/Pause: start or stop file playback
 - Volume: adjust output gain
 - Theme: switch the interface theme
 - Fullscreen: toggle fullscreen mode
+- Clear Trace: clear the oscilloscope history
 
 ## Requirements
 
 - Rust and Cargo
 - Linux desktop environment
 - Audio device available through PipeWire/ALSA
+- Microphone access enabled for live input capture
 
 ## Development
 

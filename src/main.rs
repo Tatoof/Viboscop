@@ -6,6 +6,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::Duration;
+use std::collections::VecDeque;
 
 use anyhow::{Context as AnyhowContext, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -18,7 +19,7 @@ use eframe::{
 };
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
-use viboscop::audio::load_audio_file;
+use viboscop::audio::{load_audio_file, InputSource, create_microphone_input_stream, list_all_input_devices};
 use viboscop::scope::TraceHistory;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,8 +318,21 @@ impl PlaybackHandle {
 enum SettingsTab {
     Appearance,
     Visualization,
+    InputSource,
     Tutorial,
     About,
+}
+
+impl std::fmt::Display for SettingsTab {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Appearance => write!(f, "Appearance"),
+            Self::Visualization => write!(f, "Visualization"),
+            Self::InputSource => write!(f, "Input Source"),
+            Self::Tutorial => write!(f, "Tutorial"),
+            Self::About => write!(f, "About"),
+        }
+    }
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -395,12 +409,23 @@ struct ViboscopApp {
     fullscreen: bool,
     x_scale: f32,
     y_scale: f32,
+    current_input_source: InputSource,
+    input_stream: Option<cpal::Stream>,
+    input_samples: Option<Arc<Mutex<VecDeque<f32>>>>,
+    available_input_devices: Vec<String>,
+    selected_input_device: Option<usize>,
+    input_error: Option<String>,
 }
 
 impl ViboscopApp {
     fn new(cc: &CreationContext<'_>) -> Self {
         let settings = load_settings();
         configure_fonts(&cc.egui_ctx);
+        
+        let available_input_devices = list_all_input_devices()
+            .map(|devices| devices.iter().map(|(name, _)| name.clone()).collect())
+            .unwrap_or_default();
+        
         Self {
             settings,
             settings_tab: SettingsTab::Appearance,
@@ -417,6 +442,12 @@ impl ViboscopApp {
             fullscreen: false,
             x_scale: 1.0,
             y_scale: 1.0,
+            current_input_source: InputSource::File,
+            input_stream: None,
+            input_samples: None,
+            available_input_devices,
+            selected_input_device: None,
+            input_error: None,
         }
     }
 
@@ -428,7 +459,7 @@ impl ViboscopApp {
 
     fn open_file_dialog(&mut self) {
         let file = FileDialog::new()
-            .add_filter("Audio", &["wav", "flac"])
+            .add_filter("Audio", &["wav", "flac", "mp3"])
             .set_directory(".")
             .pick_file();
 
@@ -507,6 +538,79 @@ impl ViboscopApp {
         }
     }
 
+    fn stop_input_stream(&mut self) {
+        if let Some(stream) = self.input_stream.take() {
+            stream.pause().ok();
+        }
+        self.input_samples = None;
+        self.input_error = None;
+        self.playing = false;
+    }
+
+    fn live_source_name(&self) -> String {
+        match self.current_input_source {
+            InputSource::Microphone => self
+                .selected_input_device
+                .and_then(|idx| self.available_input_devices.get(idx))
+                .cloned()
+                .unwrap_or_else(|| "Default microphone".to_owned()),
+            InputSource::File => "No source".to_owned(),
+        }
+    }
+
+    fn start_microphone_input(&mut self) {
+        self.stop_input_stream();
+        self.current_input_source = InputSource::Microphone;
+        self.file_error = None;
+        self.is_loading = false;
+        self.load_rx = None;
+        self.playback = None;
+
+        let device_name = self
+            .selected_input_device
+            .and_then(|idx| self.available_input_devices.get(idx))
+            .map(|s| s.as_str());
+
+        if self.available_input_devices.is_empty() && device_name.is_none() {
+            self.input_error = Some(
+                "No microphone devices were detected. Check your system audio settings or permissions."
+                    .to_string(),
+            );
+            self.current_input_source = InputSource::File;
+            return;
+        }
+
+        match create_microphone_input_stream(device_name, self.sample_rate, 2) {
+            Ok((stream, samples)) => {
+                self.input_stream = Some(stream);
+                self.input_samples = Some(samples);
+                self.input_error = None;
+                self.playing = true;
+                self.audio_name = format!("Microphone: {}", self.live_source_name());
+                self.sample_rate = 44100;
+                self.duration_seconds = 0.0;
+            }
+            Err(err) => {
+                self.input_error = Some(format!(
+                    "Microphone unavailable: {}. Check permissions or select a different device.",
+                    err
+                ));
+                self.current_input_source = InputSource::File;
+                self.playing = false;
+            }
+        }
+    }
+
+    fn switch_to_file_input(&mut self) {
+        self.stop_input_stream();
+        self.current_input_source = InputSource::File;
+        self.audio_name = String::from("No track loaded");
+        self.playback = None;
+        self.playing = false;
+        self.input_error = None;
+        self.file_error = None;
+    }
+
     fn draw_scope(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect().shrink(12.0);
         let painter = ui.painter();
@@ -583,7 +687,15 @@ impl ViboscopApp {
             }
         }
 
-        if self.playback.is_none() && !self.is_loading {
+        if self.is_loading {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Loading audio…",
+                egui::FontId::proportional(20.0),
+                palette.accent,
+            );
+        } else if self.current_input_source == InputSource::File && self.playback.is_none() {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -591,11 +703,11 @@ impl ViboscopApp {
                 egui::FontId::proportional(20.0),
                 palette.muted,
             );
-        } else if self.is_loading {
+        } else if self.input_stream.is_some() && self.current_input_source != InputSource::File {
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Loading audio…",
+                "Listening for live audio…",
                 egui::FontId::proportional(20.0),
                 palette.accent,
             );
@@ -612,11 +724,12 @@ impl ViboscopApp {
                 for tab in [
                     SettingsTab::Appearance,
                     SettingsTab::Visualization,
+                    SettingsTab::InputSource,
                     SettingsTab::Tutorial,
                     SettingsTab::About,
                 ] {
                     let selected = self.settings_tab == tab;
-                    if ui.selectable_label(selected, format!("{tab:?}")).clicked() {
+                    if ui.selectable_label(selected, tab.to_string()).clicked() {
                         self.settings_tab = tab;
                     }
                 }
@@ -667,25 +780,88 @@ impl ViboscopApp {
                         self.persist();
                     }
                 }
+                SettingsTab::InputSource => {
+                    ui.vertical(|ui| {
+                        ui.label("Input Source");
+                        ui.separator();
+
+                        ui.group(|ui| {
+                            ui.set_min_width(320.0);
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.selectable_label(self.current_input_source == InputSource::File, "File").clicked() {
+                                    self.switch_to_file_input();
+                                }
+                                if ui.selectable_label(self.current_input_source == InputSource::Microphone, "Microphone").clicked() {
+                                    self.start_microphone_input();
+                                }
+                                            });
+                        });
+
+                        ui.separator();
+
+                        if self.current_input_source == InputSource::Microphone {
+                            ui.label("Microphone");
+                            if self.available_input_devices.is_empty() {
+                                ui.colored_label(Color32::from_rgb(255, 120, 120), "No microphone devices detected.");
+                            } else {
+                                let current_device = self.selected_input_device
+                                    .and_then(|idx| self.available_input_devices.get(idx))
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("Select a device")
+                                    .to_string();
+                                let mut new_selection = self.selected_input_device;
+                                ComboBox::from_label("Microphone device")
+                                    .selected_text(current_device)
+                                    .show_ui(ui, |ui| {
+                                        for (idx, device) in self.available_input_devices.iter().enumerate() {
+                                            ui.selectable_value(&mut new_selection, Some(idx), device.as_str());
+                                        }
+                                    });
+                                if new_selection != self.selected_input_device {
+                                    self.selected_input_device = new_selection;
+                                    self.start_microphone_input();
+                                }
+                            }
+                        }
+
+                        if self.current_input_source == InputSource::File {
+                            ui.label("File input");
+                            ui.horizontal(|ui| {
+                                if ui.button("Add File").clicked() {
+                                    self.open_file_dialog();
+                                }
+                                if ui.button("Clear").clicked() {
+                                    self.switch_to_file_input();
+                                }
+                            });
+                        }
+
+                        if let Some(err) = &self.input_error {
+                            ui.colored_label(Color32::from_rgb(255, 120, 120), format!("Error: {}", err));
+                        }
+                    });
+                }
                 SettingsTab::Tutorial => {
                     ui.label("Tutorial");
                     ui.indent("tutorial", |ui| {
-                        ui.monospace("1. Load audio: click Add File and choose a WAV or FLAC recording.");
+                        ui.monospace("1. Load audio: click Add File and choose a WAV, FLAC, or MP3 recording.");
                         ui.monospace("2. Play and seek: use the playback controls and progress bar.");
-                        ui.monospace("3. XY mode: left channel drives X and right channel drives Y.");
-                        ui.monospace("4. Invert axes: use Invert X and Invert Y in Visualization settings.");
-                        ui.monospace("5. Adjust trace fidelity with Continuous, Adaptive, Points, or Segmented modes.");
-                        ui.monospace("6. Switch theme presets to tune the dark interface while keeping the amber trace.");
-                        ui.monospace("7. Use Fullscreen for a larger scope view.");
+                        ui.monospace("3. Live input: use Microphone in the Input Source tab.");
+                        ui.monospace("4. XY mode: left channel drives X and right channel drives Y.");
+                        ui.monospace("5. Invert axes: use Invert X and Invert Y in Visualization settings.");
+                        ui.monospace("6. Adjust trace fidelity with Continuous, Adaptive, Points, or Segmented modes.");
+                        ui.monospace("7. Switch theme presets to tune the dark interface while keeping the amber trace.");
+                        ui.monospace("8. Use Fullscreen for a larger scope view.");
                     });
                 }
                 SettingsTab::About => {
                     ui.vertical_centered(|ui| {
                         ui.label(RichText::new("Viboscop").size(24.0));
                         ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-                        ui.label("Stereo XY oscilloscope for WAV and FLAC files.");
+                        ui.label("Stereo XY oscilloscope for WAV, FLAC, and MP3 files.");
+                        ui.label("Supports live microphone input and file-based playback.");
                         ui.separator();
-                        ui.label("Features: native desktop interface, WAV/FLAC audio playback, live XY scope, theme presets, fullscreen support.");
+                        ui.label("Features: native desktop interface, multi-format audio playback, live input capture, live XY scope, theme presets, fullscreen support.");
                         ui.label("License: MIT");
                     });
                 }
@@ -743,24 +919,56 @@ impl eframe::App for ViboscopApp {
             self.playing = playback.is_playing();
         }
 
+        // Update trace history from live input streams
+        if let Some(samples_arc) = &self.input_samples {
+            if let Ok(mut samples) = samples_arc.lock() {
+                if samples.len() >= 2 {
+                    let mut history = self.history.lock().unwrap();
+                    while samples.len() >= 2 {
+                        let left = samples.pop_front().unwrap_or(0.0);
+                        let right = samples.pop_front().unwrap_or(0.0);
+                        history.push((left, right));
+                    }
+                }
+            }
+        }
+
         TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(RichText::new("Viboscop").size(22.0));
                 ui.separator();
-                if ui.button("Add File").clicked() {
-                    self.open_file_dialog();
-                }
-                if ui
-                    .button(if self.playing { "Pause" } else { "Play" })
-                    .clicked()
-                {
-                    self.toggle_playback();
-                }
-                if ui.button("Restart").clicked() {
-                    if let Some(playback) = &self.playback {
-                        playback.reset();
+
+                match self.current_input_source {
+                    InputSource::File => {
+                        if ui.button("Add File").clicked() {
+                            self.open_file_dialog();
+                        }
+                        if ui
+                            .button(if self.playing { "Pause" } else { "Play" })
+                            .clicked()
+                        {
+                            self.toggle_playback();
+                        }
+                        if ui.button("Restart").clicked() {
+                            if let Some(playback) = &self.playback {
+                                playback.reset();
+                            }
+                        }
+                    }
+                    InputSource::Microphone => {
+                        let button_text = if self.input_stream.is_some() { "Stop Mic" } else { "Start Mic" };
+                        if ui.button(button_text).clicked() {
+                            if self.input_stream.is_some() {
+                                self.stop_input_stream();
+                                self.current_input_source = InputSource::File;
+                            } else {
+                                self.start_microphone_input();
+                            }
+                        }
+                        ui.label(RichText::new("Live input").color(Color32::from_rgb(104, 208, 162)));
                     }
                 }
+
                 if ui.button("Theme").clicked() {
                     self.settings.theme = self.settings.theme.next();
                     self.persist();
@@ -822,39 +1030,51 @@ impl eframe::App for ViboscopApp {
             ui.painter().rect_filled(ui.max_rect(), 16.0, palette.bg);
             self.draw_scope(ui);
 
-            let title = RichText::new(&self.audio_name)
-                .size(16.0)
-                .color(palette.text);
-            let info = RichText::new(format!(
-                "{} Hz • {} • volume {}%",
-                self.sample_rate,
-                format_duration(self.duration_seconds),
-                (self.volume * 100.0).round() as u32,
-            ))
-            .size(11.0)
-            .color(palette.muted);
-
             let top_left = ui.max_rect().left_top() + vec2(16.0, 12.0);
+            let title = match self.current_input_source {
+                InputSource::File => self.audio_name.clone(),
+                InputSource::Microphone => format!("Microphone: {}", self.live_source_name()),
+            };
+            let status = match self.current_input_source {
+                InputSource::File => format!(
+                    "{} Hz • {} • volume {}%",
+                    self.sample_rate,
+                    format_duration(self.duration_seconds),
+                    (self.volume * 100.0).round() as u32,
+                ),
+                InputSource::Microphone => {
+                    let signal = if self.input_stream.is_some() {
+                        "Listening • signal active"
+                    } else {
+                        "Waiting for input"
+                    };
+                    format!("{} • {} • volume {}%", self.sample_rate, signal, (self.volume * 100.0).round() as u32)
+                }
+            };
+
             ui.painter().text(
                 top_left,
                 egui::Align2::LEFT_TOP,
-                title.text().to_owned(),
+                title,
                 egui::FontId::proportional(16.0),
                 palette.text,
             );
             ui.painter().text(
                 top_left + vec2(0.0, 18.0),
                 egui::Align2::LEFT_TOP,
-                info.text().to_owned(),
+                status,
                 egui::FontId::proportional(11.0),
                 palette.muted,
             );
 
-            if let Some(err) = &self.file_error {
+            if let Some(err) = match self.current_input_source {
+                InputSource::File => self.file_error.clone(),
+                InputSource::Microphone => self.input_error.clone(),
+            } {
                 ui.painter().text(
                     ui.max_rect().right_bottom() - vec2(16.0, 18.0),
                     egui::Align2::RIGHT_BOTTOM,
-                    err.clone(),
+                    err,
                     egui::FontId::proportional(12.0),
                     Color32::from_rgb(255, 110, 110),
                 );

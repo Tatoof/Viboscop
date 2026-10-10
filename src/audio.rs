@@ -11,6 +11,28 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use symphonia::default::get_codecs;
 use symphonia::default::get_probe;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum InputSource {
+    File,
+    Microphone,
+}
+
+impl std::fmt::Display for InputSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InputSource::File => write!(f, "File"),
+            InputSource::Microphone => write!(f, "Microphone"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioDevice {
+    pub name: String,
+    pub is_loopback: bool,
+}
 
 #[derive(Clone, Debug)]
 pub struct AudioFile {
@@ -141,3 +163,83 @@ pub fn load_audio_file(path: &Path) -> Result<AudioFile> {
         samples: interleaved,
     })
 }
+
+pub fn get_microphone_devices() -> Result<Vec<AudioDevice>> {
+    let host = cpal::default_host();
+    let mut devices = Vec::new();
+    
+    for device in host.input_devices()? {
+        if let Ok(name) = device.name() {
+            devices.push(AudioDevice {
+                name,
+                is_loopback: false,
+            });
+        }
+    }
+    
+    Ok(devices)
+}
+
+pub fn list_all_input_devices() -> Result<Vec<(String, bool)>> {
+    let host = cpal::default_host();
+    let mut devices = Vec::new();
+
+    for device in host.input_devices()? {
+        if let Ok(name) = device.name() {
+            devices.push((name, false));
+        }
+    }
+
+    Ok(devices)
+}
+
+pub fn create_microphone_input_stream(
+    device_name: Option<&str>,
+    sample_rate: u32,
+    channels: u16,
+) -> Result<(cpal::Stream, std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<f32>>>)> {
+    use std::sync::{Arc, Mutex};
+    use std::collections::VecDeque;
+    
+    let host = cpal::default_host();
+    
+    let device = if let Some(name) = device_name {
+        host.input_devices()?
+            .find(|d| d.name().map(|n| n == name).unwrap_or(false))
+            .context("device not found")?
+    } else {
+        host.default_input_device()
+            .context("no default input device found")?
+    };
+    
+    let stream_cfg = cpal::StreamConfig {
+        channels,
+        sample_rate: cpal::SampleRate(sample_rate.max(8000)),
+        buffer_size: cpal::BufferSize::Default,
+    };
+    
+    let samples = Arc::new(Mutex::new(VecDeque::<f32>::with_capacity(sample_rate as usize * 2)));
+    let samples_clone = Arc::clone(&samples);
+    let max_samples = (sample_rate as usize) * 5; // Keep 5 seconds of audio
+    
+    let stream = device.build_input_stream(
+        &stream_cfg,
+        move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            if let Ok(mut buf) = samples_clone.try_lock() {
+                for &sample in data {
+                    buf.push_back(sample);
+                    // Keep buffer size manageable
+                    if buf.len() > max_samples {
+                        buf.pop_front();
+                    }
+                }
+            }
+        },
+        |err| eprintln!("input stream error: {err}"),
+        None,
+    )?;
+    
+    stream.play()?;
+    Ok((stream, samples))
+}
+
