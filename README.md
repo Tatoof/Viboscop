@@ -1,5 +1,5 @@
 # Viboscop
-
+<img width="889" height="1035" alt="image" src="https://github.com/user-attachments/assets/6f34a380-6f56-4a2f-b3d9-33a6c486911e" />
 Viboscop is a native Rust desktop app for visualizing stereo audio as a live XY oscilloscope.
 
 It supports:
